@@ -98,3 +98,54 @@ class Route(Base):
     request_json = Column(Text, nullable=False)  # 道路图、起终点、出发时间快照
     result_json = Column(Text, nullable=False)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class TransportProgress(Base):
+    """运输进度：success 路线绑定到同方案 in_progress 执行单后的现场上报状态。"""
+
+    __tablename__ = "transport_progress"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_id = Column(
+        Integer, ForeignKey("executions.id"), nullable=False, unique=True, index=True
+    )
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False, index=True)
+    # in_transit（运输中）/ blocked（延误后重排无解，已阻断）/ arrived（抵达终点）
+    status = Column(String(16), nullable=False, default="in_transit")
+    # 当前所在节点：最后一条已通过路段的 to_node，初始为路线起点
+    current_node = Column(String(64), nullable=False)
+    # 已应用的最后连续 checkpoint 序号，从 0 开始
+    last_sequence = Column(Integer, nullable=False, default=0)
+    # 不可变快照：origin/destination/departure_at/original_arrival_at/hazard_classes
+    plan_json = Column(Text, nullable=False)
+    # 动态状态：remaining（调整后的剩余逐段计划）、waits、planned_arrival_at、
+    # delay_minutes、blockages（重排无解时的阻断原因），时刻均为 UTC ISO 字符串
+    state_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class TransportCheckpoint(Base):
+    """现场上报的已通过路段 checkpoint（幂等记录：checkpoint_id 唯一，载荷随首次提交固化）。"""
+
+    __tablename__ = "transport_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("progress_id", "checkpoint_id", name="uq_progress_checkpoint_id"),
+        UniqueConstraint("progress_id", "sequence", name="uq_progress_checkpoint_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    progress_id = Column(Integer, ForeignKey("transport_progress.id"), nullable=False, index=True)
+    checkpoint_id = Column(String(64), nullable=False)
+    sequence = Column(Integer, nullable=False)
+    segment_id = Column(String(64), nullable=False)
+    from_node = Column(String(64), nullable=False)
+    to_node = Column(String(64), nullable=False)
+    # UTC ISO 字符串：实际到达时刻 / 上报时该段（可能已调整的）计划时刻
+    arrived_at = Column(Text, nullable=False)
+    planned_departure_at = Column(Text, nullable=False)
+    planned_arrival_at = Column(Text, nullable=False)
+    drive_minutes = Column(Integer, nullable=False)
+    delay_minutes = Column(Integer, nullable=False)  # 实际到达 - 计划到达（分钟，负为提前）
+    created_at = Column(DateTime, nullable=False, default=_utcnow)

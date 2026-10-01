@@ -13,6 +13,13 @@
 - **现场执行模块**：为 success 方案创建执行单并冻结货物与舱室分配；批量接收扫描事件，
   按序号连续、同事务按序应用，违规整批回滚并返回首个错误与提交前状态；
   event_id 幂等去重，全部卸完自动完成。
+- **危险品运输进度模块**：把一条 success 路线绑定到**同方案 in_progress 执行单**后，
+  现场按顺序上报已通过路段与 UTC 到达时刻；checkpoint 带唯一 checkpoint_id、连续
+  sequence、segment_id、arrived_at，必须匹配当前待行路段，时间不倒退且不早于该段
+  物理到达时刻；相同编号同载荷重试幂等、冲突 409、一批任一错误整批回滚。实际到达晚于
+  计划时，依据路线保存的道路图、禁运类别、禁行窗口与节点等待规则**从当前节点重排剩余
+  路段**，返回已完成段、调整后的剩余计划与延误；重排无解置进度为 **blocked** 且不提交
+  该批（阻断原因持久化、仍可查询），抵达终点为 **arrived**。
 - **危险品运输路线编排**：为 success 方案提交本地有向道路图（路段 ID、行驶分钟、
   禁运类别、UTC 禁行窗口、节点是否允许等待）与起终点、出发时间；危险类别自动从
   方案**原始货物**提取。禁行窗口按 `[start,end)` 半开处理，通行区间与其相交即不可
@@ -46,6 +53,7 @@ python tests/test_solver.py
 python tests/test_execution.py
 python tests/test_routing.py
 python tests/test_routes.py
+python tests/test_progress.py
 ```
 
 ## 接口一览
@@ -63,6 +71,9 @@ python tests/test_routes.py
 | POST | `/plans/{plan_id}/routes` | 为 success 方案编排危险品运输路线（201） |
 | GET | `/plans/{plan_id}/routes` | 列出该方案下的路线摘要 |
 | GET | `/routes/{route_id}` | 按路线编号查询编排结果（逐段时刻、等待/阻断） |
+| POST | `/executions/{execution_id}/progress` | 把一条 success 路线绑定到同方案 in_progress 执行单（201） |
+| POST | `/progress/{progress_id}/checkpoints` | 批量上报已通过路段 checkpoint（按序应用、幂等、整批回滚、延误重排） |
+| GET | `/progress/{progress_id}` | 查询运输进度：已完成段、调整后的剩余计划、延误与阻断 |
 
 ## 请求示例
 
@@ -598,6 +609,196 @@ curl http://localhost:8000/plans/1/routes   # 列出该方案下全部路线摘�
 重启容器后仍可按编号查询。错误码：`404`（方案或路线不存在）、
 `409`（为非 success 方案编排）、`422`（图引用错误、时刻不带时区或未对齐整分钟）。
 
+## 危险品运输进度
+
+车辆**发车后**，现场按通过顺序上报已通过路段及其 UTC 到达时刻。上报前需先把一条
+`status=success` 的路线绑定到现场执行单，系统据此创建可查询的运输进度。
+
+### 12. 绑定路线到执行单
+
+`POST /executions/{execution_id}/progress`，请求体仅含路线编号：
+
+```bash
+curl -X POST http://localhost:8000/executions/1/progress \
+  -H 'Content-Type: application/json' \
+  -d '{"route_id": 1}'
+```
+
+绑定条件（任一不满足返回 **409**）：
+
+- 路线 `status=success`（infeasible 路线不得绑定）；
+- 执行单 `status=in_progress`（已完成执行单不得绑定）；
+- 路线与执行单属于**同一方案**；
+- 每个执行单至多绑定一条路线（重复绑定 409）。
+
+实体不存在返回 **404**。绑定成功（201）即创建运输进度，初始剩余计划为路线的完整
+逐段计划，`current_node` 为起点，`last_sequence=0`，状态 `in_transit`：
+
+```json
+{
+  "progress_id": 1,
+  "execution_id": 1,
+  "route_id": 1,
+  "plan_id": 1,
+  "status": "in_transit",
+  "origin": "A",
+  "destination": "Z",
+  "departure_at": "2026-09-29T08:00:00Z",
+  "original_arrival_at": "2026-09-29T08:10:00Z",
+  "current_node": "A",
+  "planned_arrival_at": "2026-09-29T08:10:00Z",
+  "delay_minutes": 0,
+  "hazard_classes": ["3"],
+  "last_sequence": 0,
+  "completed": [],
+  "remaining_segment_ids": ["r1", "r2"],
+  "remaining_steps": [ "…逐段计划（结构与路线 steps 一致）…" ],
+  "remaining_waits": [],
+  "blockages": []
+}
+```
+
+### 13. 批量上报 checkpoint（含延误重排）
+
+`POST /progress/{progress_id}/checkpoints`，一批 checkpoint 在**同一事务**中按序应用。
+每条 checkpoint 字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `checkpoint_id` | 唯一编号，幂等键 |
+| `sequence` | 连续序号，从 1 开始，必须等于当前 `last_sequence + 1` |
+| `segment_id` | 已通过的路段编号，**必须是当前待行路段**（剩余计划首段） |
+| `arrived_at` | 实际到达该路段终点的 UTC 时刻，带时区、对齐整分钟 |
+
+校验规则（任一不满足 **422**，整批回滚并返回首个错误与提交前状态）：
+
+- `sequence` 连续；`segment_id` 匹配当前待行路段；
+- `arrived_at` **不倒退**（不早于上一条 checkpoint 的实际到达，首段不早于出发）；
+- 不早于该段**物理最早到达时刻**（从进入当前节点的实际时刻起，至少经过该段
+  `drive_minutes` 全程行驶）；节点等待只可能更晚；
+- 剩余计划为空（已抵达终点）或进度非 `in_transit` 时不得再上报新 checkpoint。
+
+**准点/提前**：消费当前待行段，剩余计划维持不变。
+**实际到达晚于该段计划到达**（`delay_minutes > 0`）：以**当前节点为起点、实际到达
+时刻为新零点**，依据路线保存的道路图、禁运类别、UTC 禁行窗口与节点等待规则重排
+剩余路段（可绕行、可在允许等待的节点等待、全禁等图中可环行），仍按
+最早到达 → 总等待最少 → 路段序列字典序取唯一结果。
+
+沿用路线示例 8 的图（`r1` A→M 5 分钟、`r2` M→Z 5 分钟，`r2` 窗口 `[08:10,09:00)`，
+原计划 08:10 到达 Z）。车辆实际 08:08 才到 M（该段延误 3 分钟）：
+
+```bash
+curl -X POST http://localhost:8000/progress/1/checkpoints \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "checkpoints": [
+      {"checkpoint_id": "cp-1", "sequence": 1, "segment_id": "r1",
+       "arrived_at": "2026-09-29T08:08:00Z"}
+    ]
+  }'
+```
+
+08:08 进入 `r2` 的通行区间 `[08:08,08:13)` 与窗口相交，M 允许等待，重排为在 M
+等待到 09:00 再进入，预计 09:05 到达 Z（相对原计划延误 55 分钟）：
+
+```json
+{
+  "progress_id": 1,
+  "applied": 1,
+  "skipped": 0,
+  "status": "in_transit",
+  "current_node": "M",
+  "planned_arrival_at": "2026-09-29T09:05:00Z",
+  "delay_minutes": 55,
+  "last_sequence": 1,
+  "completed": [
+    {"checkpoint_id": "cp-1", "sequence": 1, "segment_id": "r1",
+     "from_node": "A", "to_node": "M",
+     "planned_departure_at": "2026-09-29T08:00:00Z",
+     "planned_arrival_at": "2026-09-29T08:05:00Z",
+     "arrived_at": "2026-09-29T08:08:00Z",
+     "drive_minutes": 5, "delay_minutes": 3}
+  ],
+  "remaining_segment_ids": ["r2"],
+  "remaining_steps": [
+    {"segment_id": "r2", "from_node": "M", "to_node": "Z",
+     "departure_at": "2026-09-29T09:00:00Z", "arrival_at": "2026-09-29T09:05:00Z",
+     "drive_minutes": 5, "wait_before_minutes": 52}
+  ],
+  "remaining_waits": [
+    {"node_id": "M", "for_segment_id": "r2",
+     "start_at": "2026-09-29T08:08:00Z", "end_at": "2026-09-29T09:00:00Z",
+     "wait_minutes": 52,
+     "blocking_windows": [
+       {"start": "2026-09-29T08:10:00Z", "end": "2026-09-29T09:00:00Z"}]}
+  ],
+  "blockages": []
+}
+```
+
+按重排计划通过末段（上报 09:05 到达 Z）后状态置为 **arrived**：
+
+```bash
+curl -X POST http://localhost:8000/progress/1/checkpoints \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "checkpoints": [
+      {"checkpoint_id": "cp-2", "sequence": 2, "segment_id": "r2",
+       "arrived_at": "2026-09-29T09:05:00Z"}
+    ]
+  }'
+# status=arrived, delay_minutes=55, remaining_segment_ids=[]
+```
+
+### 14. 幂等重试、冲突与整批回滚
+
+- **相同 checkpoint_id + 相同载荷**重试：幂等跳过（`applied=0, skipped=N`），不重复
+  推进；即使进度已 `arrived`/`blocked`，相同载荷重试仍返回当前状态；
+- **相同 checkpoint_id + 不同载荷**：返回 **409**，载荷不推进；
+- 同批次内重复编号：相同载荷跳过、不同载荷 409 且整批回滚；
+- 一批中任一新 checkpoint 违规（序号、路段、时间等）：**整批回滚（422）**，
+  `detail.state` 为提交前状态、`detail.checkpoint_id/sequence` 定位首个错误。
+
+```bash
+# 相同载荷重试 -> applied=0, skipped=1
+curl -X POST http://localhost:8000/progress/1/checkpoints \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoints": [
+        {"checkpoint_id": "cp-1", "sequence": 1, "segment_id": "r1",
+         "arrived_at": "2026-09-29T08:08:00Z"}]}'
+
+# 相同编号、不同到达时刻 -> 409
+curl -X POST http://localhost:8000/progress/1/checkpoints \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoints": [
+        {"checkpoint_id": "cp-1", "sequence": 1, "segment_id": "r1",
+         "arrived_at": "2026-09-29T08:09:00Z"}]}'
+```
+
+### 15. 延误后重排无解：blocked（不提交该批）
+
+若延误后从当前节点重排剩余路段**无可行方案**（唯一出路被禁运类别恒闭，或窗口关闭且
+节点禁等、环行也无法越过），系统：
+
+1. 将进度置为 **blocked**，把稳定排序的阻断原因写入 `blockages`（持久化、仍可查询）；
+2. **不提交该批 checkpoint**：`last_sequence`、已完成段、当前节点与剩余计划均保持
+   提交前状态（最近一次延误分钟记录在 `delay_minutes`，`planned_arrival_at=null`）；
+3. 返回 **422**，`detail.blockages` 给阻断原因，`detail.state` 为已置 blocked 的进度。
+
+blocked 后新的 checkpoint 一律 422 拒绝（该批不提交，故失败的 checkpoint 编号也
+未被占用，不会误判为幂等重试）。
+
+### 16. 查询运输进度
+
+```bash
+curl http://localhost:8000/progress/1
+```
+
+返回绑定信息、状态（`in_transit` / `blocked` / `arrived`）、当前节点、按序号升序的
+已完成段、调整后的剩余计划（`remaining_segment_ids` / `remaining_steps` /
+`remaining_waits`）、预计到达与延误（`planned_arrival_at` / `delay_minutes`），以及
+blocked 时的 `blockages`。进度不存在返回 **404**。
+
 ## 请求字段说明
 
 | 字段 | 说明 |
@@ -644,9 +845,10 @@ app/
   solver.py        # CP-SAT 两阶段求解 + 不可行冲突诊断
   executions.py    # 现场执行：执行单创建、扫描事件批次应用与状态查询
   routing.py       # 时间相关多标号最短路：禁运、半开窗口、节点等待、环行、阻断收集
-  route_service.py # 路线编排服务：危险类别提取、UTC 换算、持久化与查询
+  route_service.py # 路线编排服务：危险类别提取、UTC 换算、持久化、道路图重排复用
+  progress.py      # 运输进度：路线绑定执行单、checkpoint 批次应用、延误重排与 blocked/arrived
   schemas.py       # 请求/响应模型与校验
-  models.py        # ORM：方案、禁配规则、执行单、货物状态、事件记录、路线
+  models.py        # ORM：方案、禁配规则、执行单、货物状态、事件记录、路线、运输进度、checkpoint
   database.py      # SQLite 连接
   seed.py          # 示例禁配规则初始化
 tests/
@@ -654,6 +856,7 @@ tests/
   test_execution.py
   test_routing.py
   test_routes.py
+  test_progress.py
 Dockerfile
 docker-compose.yml
 requirements.txt

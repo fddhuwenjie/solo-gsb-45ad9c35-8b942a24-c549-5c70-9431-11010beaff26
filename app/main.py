@@ -10,9 +10,12 @@ from sqlalchemy.orm import Session
 from .database import Base, SessionLocal, engine, get_db
 from .executions import apply_event_batch, create_execution, get_execution
 from .models import Plan, SegregationRule
+from .progress import apply_checkpoint_batch, bind_route, get_progress
 from .route_service import create_route, get_route, list_routes_for_plan
 from .schemas import (
     AssignmentOut,
+    CheckpointBatchIn,
+    CheckpointBatchResult,
     CompartmentLoad,
     ConflictOut,
     EventBatchIn,
@@ -21,10 +24,12 @@ from .schemas import (
     PlanRequest,
     PlanResponse,
     PlanSummary,
+    ProgressBindIn,
     RouteRequest,
     RouteResponse,
     RouteSummary,
     RuleOut,
+    TransportProgressOut,
 )
 from .seed import seed_rules
 from .solver import Cargo, Compartment, Incompatibility, solve_plan
@@ -54,9 +59,11 @@ app = FastAPI(
     title="危险化学品同车分舱规划 API",
     description="基于 OR-Tools CP-SAT 的分舱规划（最少舱室优先，禁配隔离，结果稳定可复现），"
                 "支持方案现场执行（扫描事件按序应用、幂等重试、整批回滚），"
-                "以及危险品运输路线编排（禁运类别、UTC 半开禁行窗口、节点等待，"
-                "按最早到达/总等待最少/路段序列字典序确定唯一结果）。",
-    version="1.1.0",
+                "危险品运输路线编排（禁运类别、UTC 半开禁行窗口、节点等待，"
+                "按最早到达/总等待最少/路段序列字典序确定唯一结果），"
+                "以及运输进度上报（路线绑定执行单、checkpoint 幂等批次、"
+                "延误按保存道路图重排剩余路段、blocked/arrived 状态机）。",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -257,3 +264,50 @@ def list_plan_routes(plan_id: int, db: Session = Depends(get_db)):
 def get_route_state(route_id: int, db: Session = Depends(get_db)):
     """按路线编号查询编排结果（逐段时刻、等待记录或阻断原因）。"""
     return get_route(db, route_id)
+
+
+# ---------- 危险品运输进度 ----------
+
+
+@app.post(
+    "/executions/{execution_id}/progress",
+    response_model=TransportProgressOut,
+    status_code=201,
+)
+def bind_execution_route(
+    execution_id: int, body: ProgressBindIn, db: Session = Depends(get_db)
+):
+    """把一条 success 路线绑定到同方案的 in_progress 执行单，创建运输进度。
+
+    - 路线必须 status=success、执行单必须 status=in_progress，且两者属于
+      同一方案；已完成执行单、非 success 路线、方案不同均返回 409；
+    - 同一执行单至多绑定一条路线，重复绑定返回 409。
+    """
+    return bind_route(db, execution_id, body)
+
+
+@app.post(
+    "/progress/{progress_id}/checkpoints",
+    response_model=CheckpointBatchResult,
+)
+def submit_progress_checkpoints(
+    progress_id: int, batch: CheckpointBatchIn, db: Session = Depends(get_db)
+):
+    """批量上报已通过路段 checkpoint，同一事务中按序应用。
+
+    - 每条 checkpoint 带唯一 checkpoint_id、连续 sequence、segment_id、
+      arrived_at；segment 必须是当前待行路段，时间不倒退、不早于该段物理
+      最早到达时刻且对齐整分钟；
+    - 相同 checkpoint_id + 相同载荷重试幂等跳过，载荷不一致返回 409；
+    - 任一新 checkpoint 违规则整批回滚（422），返回首个错误与提交前状态；
+    - 实际到达晚于计划时，按路线保存的道路图、禁运类别、禁行窗口与节点
+      等待规则从当前节点重排剩余路段；重排无解则进度置为 blocked 且不提交
+      该批；抵达终点后置为 arrived。
+    """
+    return apply_checkpoint_batch(db, progress_id, batch)
+
+
+@app.get("/progress/{progress_id}", response_model=TransportProgressOut)
+def get_progress_state(progress_id: int, db: Session = Depends(get_db)):
+    """查询运输进度：已完成段、调整后的剩余计划、延误与阻断原因。"""
+    return get_progress(db, progress_id)

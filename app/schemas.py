@@ -322,3 +322,107 @@ class RouteSummary(BaseModel):
     arrival_at: Optional[datetime] = None
     total_wait_minutes: int
     created_at: datetime
+
+
+# ---------- 危险品运输进度 ----------
+
+
+class ProgressBindIn(BaseModel):
+    """把一条 success 路线绑定到执行单（同方案、执行单 in_progress）。"""
+
+    route_id: int = Field(gt=0, description="要绑定的 success 路线编号")
+
+
+class CheckpointIn(BaseModel):
+    """一条现场 checkpoint：已通过路段及其 UTC 到达时刻。"""
+
+    checkpoint_id: str = Field(min_length=1, max_length=64, description="checkpoint 唯一编号（幂等键）")
+    sequence: int = Field(ge=1, description="连续序号，从 1 开始逐条递增")
+    segment_id: str = Field(min_length=1, max_length=64, description="已通过的路段编号（须为当前待行路段）")
+    arrived_at: datetime = Field(description="实际到达该路段终点的 UTC 时刻（带时区，整分钟）")
+
+    @field_validator("arrived_at")
+    @classmethod
+    def _arrived_aware(cls, v: datetime) -> datetime:
+        return _aware_utc(v)
+
+
+class CheckpointBatchIn(BaseModel):
+    """一批 checkpoint：同一事务内按序应用，任一违规则整批回滚。"""
+
+    checkpoints: list[CheckpointIn] = Field(min_length=1, description="checkpoint 批次")
+
+
+class CompletedCheckpointOut(BaseModel):
+    """已完成段（实际通过记录）。"""
+
+    checkpoint_id: str
+    sequence: int
+    segment_id: str
+    from_node: str
+    to_node: str
+    planned_departure_at: datetime = Field(description="上报时该段计划进入时刻（UTC）")
+    planned_arrival_at: datetime = Field(description="上报时该段计划到达时刻（UTC）")
+    arrived_at: datetime = Field(description="实际到达时刻（UTC）")
+    drive_minutes: int
+    delay_minutes: int = Field(description="实际到达 - 计划到达（分钟，负为提前）")
+
+
+class RemainingStepOut(BaseModel):
+    """调整后的剩余计划逐段时刻（结构与路线编排 steps 一致）。"""
+
+    segment_id: str
+    from_node: str
+    to_node: str
+    departure_at: datetime
+    arrival_at: datetime
+    drive_minutes: int
+    wait_before_minutes: int
+
+
+class RemainingWaitOut(BaseModel):
+    """剩余计划中的节点等待记录（结构与路线编排 waits 一致）。"""
+
+    node_id: str
+    for_segment_id: str
+    start_at: datetime
+    end_at: datetime
+    wait_minutes: int
+    blocking_windows: list[RestrictionWindowOut]
+
+
+class TransportProgressOut(BaseModel):
+    """运输进度完整视图：绑定信息、已完成段、调整后的剩余计划与延误。"""
+
+    progress_id: int
+    execution_id: int
+    route_id: int
+    plan_id: int
+    status: str = Field(description="in_transit / blocked（重排无解，不提交该批）/ arrived（抵达终点）")
+    origin: str
+    destination: str
+    departure_at: datetime = Field(description="路线原始出发时刻（UTC）")
+    original_arrival_at: datetime = Field(description="路线原始计划到达时刻（UTC）")
+    current_node: str = Field(description="车辆当前所在节点（最后通过段的 to_node）")
+    planned_arrival_at: Optional[datetime] = Field(
+        default=None, description="按当前剩余计划预计到达终点时刻（UTC）；blocked 时为 null"
+    )
+    delay_minutes: int = Field(
+        description="预计到达相对原始计划的延误（分钟，负为提前；blocked 时为最近一次延误）"
+    )
+    hazard_classes: list[str]
+    last_sequence: int
+    completed: list[CompletedCheckpointOut] = Field(description="已完成段（按序号升序）")
+    remaining_segment_ids: list[str] = Field(description="调整后剩余计划的路段 ID 序列")
+    remaining_steps: list[RemainingStepOut]
+    remaining_waits: list[RemainingWaitOut]
+    blockages: list[RouteBlockageOut] = Field(description="status=blocked 时重排无解的阻断原因")
+    created_at: datetime
+    updated_at: datetime
+
+
+class CheckpointBatchResult(TransportProgressOut):
+    """checkpoint 批次处理结果：applied 为新应用条数，skipped 为幂等重试跳过条数。"""
+
+    applied: int
+    skipped: int

@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -160,6 +160,39 @@ def _serialize(
     }
 
 
+def plan_from_graph(
+    req: RouteRequest,
+    base_at: datetime,
+    origin: str,
+    destination: str,
+    hazard_classes: list[str],
+) -> dict:
+    """按给定基准时刻从道路图编排路线（供创建路线与延误后重排剩余路段复用）。
+
+    禁行窗口以 base_at（整分钟 UTC）为零点换算为分钟偏移；返回结构与
+    路线编排响应中的 status/arrival_at/steps/waits/blockages 等字段一致
+    （datetime 为 UTC 值，未做 JSON 字符串化）。
+    """
+    base = _to_utc(base_at)
+    base_epoch_min = _minute_origin(base)
+    nodes, segments = _build_graph(req, base_epoch_min)
+    result = plan_route(
+        segments=segments,
+        nodes=nodes,
+        origin=origin,
+        destination=destination,
+        carried_classes=set(hazard_classes),
+    )
+    payload = _serialize(result, base, hazard_classes)
+    payload.update({
+        "origin": origin,
+        "destination": destination,
+        "departure_at": base,
+        "hazard_classes": hazard_classes,
+    })
+    return payload
+
+
 def create_route(db: Session, plan_id: int, req: RouteRequest) -> RouteResponse:
     """为方案编排危险品运输路线并持久化。"""
     plan = db.get(Plan, plan_id)
@@ -173,24 +206,11 @@ def create_route(db: Session, plan_id: int, req: RouteRequest) -> RouteResponse:
 
     hazard_classes = extract_hazard_classes(plan)
     departure = _to_utc(req.departure_at)
-    departure_epoch_min = _minute_origin(departure)
-    nodes, segments = _build_graph(req, departure_epoch_min)
-
-    result = plan_route(
-        segments=segments,
-        nodes=nodes,
-        origin=req.origin,
-        destination=req.destination,
-        carried_classes=set(hazard_classes),
+    _minute_origin(departure)  # 校验整分钟
+    payload = plan_from_graph(
+        req, departure, req.origin, req.destination, hazard_classes
     )
-    payload = _serialize(result, departure, hazard_classes)
-    payload.update({
-        "plan_id": plan_id,
-        "origin": req.origin,
-        "destination": req.destination,
-        "departure_at": departure,
-        "hazard_classes": hazard_classes,
-    })
+    payload["plan_id"] = plan_id
 
     route = Route(
         plan_id=plan_id,
