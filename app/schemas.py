@@ -322,3 +322,88 @@ class RouteSummary(BaseModel):
     arrival_at: Optional[datetime] = None
     total_wait_minutes: int
     created_at: datetime
+
+
+# ---------- 运输进度 ----------
+
+
+class ProgressCreateIn(BaseModel):
+    """绑定请求：把 success 路线绑定到同方案的 in_progress 执行单。"""
+
+    execution_id: int = Field(ge=1, description="同方案的 in_progress 执行单编号")
+
+
+class CheckpointIn(BaseModel):
+    """一条通过上报：checkpoint_id 幂等，sequence 从 1 起连续递增。"""
+
+    checkpoint_id: str = Field(min_length=1, max_length=64, description="上报编号（幂等键）")
+    sequence: int = Field(ge=1, description="连续序号，从 1 开始逐条递增")
+    segment_id: str = Field(min_length=1, max_length=64, description="已通过的路段编号")
+    arrived_at: datetime = Field(description="到达路段终点的 UTC 时刻（带时区，对齐整分钟）")
+
+    @field_validator("arrived_at")
+    @classmethod
+    def _arrived_aware(cls, v: datetime) -> datetime:
+        return _aware_utc(v)
+
+
+class CheckpointBatchIn(BaseModel):
+    """一批 checkpoint：同一事务内按序应用，任一违规则整批回滚。"""
+
+    checkpoints: list[CheckpointIn] = Field(min_length=1, description="checkpoint 批次")
+
+
+class CheckpointOut(BaseModel):
+    checkpoint_id: str
+    sequence: int
+    segment_id: str
+    arrived_at: datetime
+
+
+class CompletedSegmentOut(BaseModel):
+    """已完成路段（实际上报到达时刻）。"""
+
+    sequence: int
+    checkpoint_id: str
+    segment_id: str
+    arrived_at: datetime
+
+
+class ProgressOut(BaseModel):
+    progress_id: int
+    route_id: int
+    execution_id: int
+    plan_id: int
+    status: str = Field(description="in_progress / arrived（抵达终点）/ blocked（重排无解）")
+    last_sequence: int = Field(description="已应用的最后连续序号")
+    planned_arrival_at: Optional[datetime] = Field(
+        default=None, description="路线原计划到达终点的 UTC 时刻"
+    )
+    expected_arrival_at: Optional[datetime] = Field(
+        default=None, description="当前预计（arrived 时为实际）到达终点的 UTC 时刻"
+    )
+    delay_minutes: int = Field(description="相对路线原计划到达时刻的延误分钟（非负）")
+    current_node: Optional[str] = Field(
+        default=None, description="当前所在节点（剩余计划首段起点；已到达时为终点）"
+    )
+    completed_segments: list[CompletedSegmentOut] = Field(description="已完成路段（按上报顺序）")
+    remaining_plan: list[RouteStepOut] = Field(description="调整后的剩余逐段计划")
+    checkpoints: list[CheckpointOut] = Field(description="已应用的 checkpoint 日志（按序号升序）")
+    blockages: list[RouteBlockageOut] = Field(description="blocked 时稳定排序的阻断原因")
+    created_at: datetime
+    updated_at: datetime
+
+
+class CheckpointBatchResult(BaseModel):
+    """checkpoint 批次处理结果：applied 为新应用条数，skipped 为幂等重试跳过条数。"""
+
+    progress_id: int
+    applied: int
+    skipped: int
+    status: str
+    last_sequence: int
+    delay_minutes: int
+    expected_arrival_at: Optional[datetime] = None
+    completed_segments: list[CompletedSegmentOut]
+    remaining_plan: list[RouteStepOut]
+    blockages: list[RouteBlockageOut]

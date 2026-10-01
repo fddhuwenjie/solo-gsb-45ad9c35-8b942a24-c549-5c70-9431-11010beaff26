@@ -98,3 +98,44 @@ class Route(Base):
     request_json = Column(Text, nullable=False)  # 道路图、起终点、出发时间快照
     result_json = Column(Text, nullable=False)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class TransportProgress(Base):
+    """运输进度：success 路线与同方案 in_progress 执行单的绑定及实时状态。"""
+
+    __tablename__ = "transport_progress"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, unique=True)
+    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=False, unique=True)
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False, index=True)
+    # in_progress / arrived（抵达终点）/ blocked（延误重排无解）
+    status = Column(String(16), nullable=False, default="in_progress")
+    # 已应用的最后连续序号，从 0 开始；新 checkpoint 必须为 last_sequence + 1
+    last_sequence = Column(Integer, nullable=False, default=0)
+    # 当前剩余计划：{"steps": [逐段时刻...], "expected_arrival_at": ISO|null}
+    remaining_json = Column(Text, nullable=False)
+    # 相对路线原计划到达时刻的延误分钟（非负）
+    delay_minutes = Column(Integer, nullable=False, default=0)
+    # blocked 时稳定排序的阻断原因
+    blockages_json = Column(Text, nullable=False, default="[]")
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class TransportCheckpoint(Base):
+    """已应用的通过上报（幂等记录：checkpoint_id 唯一，载荷随首次提交固化）。"""
+
+    __tablename__ = "transport_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("progress_id", "checkpoint_id", name="uq_transport_checkpoint_id"),
+        UniqueConstraint("progress_id", "sequence", name="uq_transport_checkpoint_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    progress_id = Column(Integer, ForeignKey("transport_progress.id"), nullable=False, index=True)
+    checkpoint_id = Column(String(64), nullable=False)
+    sequence = Column(Integer, nullable=False)
+    segment_id = Column(String(64), nullable=False)
+    arrived_at = Column(String(40), nullable=False)  # 到达路段终点的 UTC 时刻（ISO）
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
