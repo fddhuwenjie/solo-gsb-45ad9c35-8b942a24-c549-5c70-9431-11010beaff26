@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    container_name: hazmat-planner
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:////data/hazmat.db
+    volumes:
+      - hazmat-data:/data
+    restart: unless-stopped
+
+volumes:
+  hazmat-data:
